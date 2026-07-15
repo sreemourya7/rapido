@@ -1,10 +1,12 @@
 VALID_TRANSITIONS = {
-    "REQUESTED": {"MATCHED", "CANCELLED"},
-    "MATCHED": {"ACCEPTED", "CANCELLED"},
-    "ACCEPTED": {"IN_PROGRESS", "CANCELLED"},
+    "REQUESTED": {"OFFERED", "CANCELLED", "NO_DRIVERS"},
+    "OFFERED":   {"MATCHED", "CANCELLED", "NO_DRIVERS", "REQUESTED"},
+    "MATCHED":   {"ACCEPTED", "CANCELLED"},
+    "ACCEPTED":  {"IN_PROGRESS", "CANCELLED"},
     "IN_PROGRESS": {"COMPLETED"},
     "COMPLETED": set(),
     "CANCELLED": set(),
+    "NO_DRIVERS": set(),
 }
 
 class InvalidTransitionError(Exception):

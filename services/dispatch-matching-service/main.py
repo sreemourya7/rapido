@@ -2,23 +2,22 @@ import json
 import threading
 import time
 import redis
-import requests
 from kafka import KafkaConsumer, KafkaProducer
 from sqlalchemy import create_engine, text
 from fastapi import FastAPI
 
 app = FastAPI(title="Rapido - Dispatch Matching Service")
 
-# ── config ──────────────────────────────────────────────────────────────────
+# ── config ────────────────────────────────────────────────────────────────────
 KAFKA_BOOTSTRAP = "localhost:9092"
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
 DB_URL = "postgresql://rapido:rapido_dev_pw@localhost:5432/rapido"
-RIDE_MANAGEMENT_URL = "http://localhost:8001"
 GEO_KEY = "drivers:locations"
 SEARCH_RADIUS_KM = 5.0
+OFFER_TIMEOUT_SECONDS = 15
 
-# ── clients ──────────────────────────────────────────────────────────────────
+# ── clients ───────────────────────────────────────────────────────────────────
 redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 engine = create_engine(DB_URL)
 
@@ -28,9 +27,12 @@ producer = KafkaProducer(
 )
 
 
-# ── core matching logic ───────────────────────────────────────────────────────
-def find_nearest_available_driver(pickup_lat: float, pickup_lng: float):
-    """Query Redis for nearby drivers, return the closest available one."""
+# ── helpers ───────────────────────────────────────────────────────────────────
+def get_ranked_drivers(pickup_lat: float, pickup_lng: float):
+    """
+    Query Redis for nearby drivers sorted by distance (ASC).
+    Returns a ranked list of available drivers.
+    """
     results = redis_client.geosearch(
         GEO_KEY,
         longitude=pickup_lng,
@@ -39,114 +41,197 @@ def find_nearest_available_driver(pickup_lat: float, pickup_lng: float):
         unit="km",
         withcoord=True,
         withdist=True,
-        sort="ASC",  # closest first
+        sort="ASC",
     )
+    ranked = []
     for item in results:
         driver_id, distance, (lng, lat) = item
         if redis_client.exists(f"driver:available:{driver_id}"):
-            return driver_id, round(distance, 3)
-    return None, None
+            ranked.append({
+                "driver_id": driver_id,
+                "distance_km": round(distance, 3),
+            })
+    return ranked
 
 
-def assign_driver_transactionally(ride_id: str, driver_id: str) -> bool:
+def send_offer(ride_id: str, driver_id: str, distance_km: float):
     """
-    Atomically assign driver to ride in Postgres.
-    Only succeeds if ride is still REQUESTED and driver not already assigned.
-    This is what prevents two ride requests from claiming the same driver.
+    Publish ride.offered_to_driver event and store
+    pending offer in Redis with TTL = OFFER_TIMEOUT_SECONDS.
     """
-    with engine.begin() as conn:
-        # Lock the ride row for update
-        result = conn.execute(
-            text("""
-                SELECT id, status, driver_id
-                FROM rides
-                WHERE id = :ride_id
-                FOR UPDATE
-            """),
-            {"ride_id": ride_id},
-        ).fetchone()
+    # Store pending offer in Redis — key expires automatically after timeout
+    offer_key = f"offer:{ride_id}"
+    redis_client.set(offer_key, driver_id, ex=OFFER_TIMEOUT_SECONDS)
 
-        if not result:
-            print(f"  Ride {ride_id} not found")
-            return False
-
-        if result.status != "REQUESTED":
-            print(f"  Ride {ride_id} already in status {result.status}, skipping")
-            return False
-
-        if result.driver_id is not None:
-            print(f"  Ride {ride_id} already has driver {result.driver_id}, skipping")
-            return False
-
-        # Assign the driver
-        conn.execute(
-            text("""
-                UPDATE rides
-                SET driver_id = :driver_id, status = 'MATCHED', updated_at = now()
-                WHERE id = :ride_id
-            """),
-            {"driver_id": driver_id, "ride_id": ride_id},
-        )
-
-        # Mark driver as busy in Redis so they don't get matched to another ride
-        redis_client.delete(f"driver:available:{driver_id}")
-
-    return True
-
-
-def process_ride_requested(event: dict):
-    ride_id = event.get("ride_id")
-    pickup_lat = event.get("pickup_lat")
-    pickup_lng = event.get("pickup_lng")
-
-    print(f"\n Ride requested: {ride_id}")
-    print(f"  Pickup: {pickup_lat}, {pickup_lng}")
-
-    # 1. Find nearest available driver from Redis
-    driver_id, distance_km = find_nearest_available_driver(pickup_lat, pickup_lng)
-
-    if not driver_id:
-        print(f"  No available drivers near {pickup_lat}, {pickup_lng}")
-        return
-
-    print(f"  Nearest driver: {driver_id} ({distance_km} km away)")
-
-    # 2. Transactionally assign in Postgres
-    success = assign_driver_transactionally(ride_id, driver_id)
-
-    if not success:
-        print(f"  Assignment failed for ride {ride_id}")
-        return
-
-    print(f"  Driver {driver_id} assigned to ride {ride_id}")
-
-    # 3. Publish ride.matched event
-    event_out = {
-        "event_type": "ride.matched",
+    # Publish offer event to Kafka
+    producer.send("ride.offered_to_driver", value={
+        "event_type": "ride.offered_to_driver",
         "ride_id": ride_id,
         "driver_id": driver_id,
         "distance_km": distance_km,
-    }
-    producer.send("ride.matched", value=event_out)
+        "timeout_seconds": OFFER_TIMEOUT_SECONDS,
+    })
     producer.flush()
-    print(f"  Published ride.matched event")
+    print(f"  Offer sent to {driver_id} for ride {ride_id} "
+          f"(timeout: {OFFER_TIMEOUT_SECONDS}s)")
 
 
-# ── Kafka consumer loop (runs in background thread) ───────────────────────────
+def update_ride_status(ride_id: str, new_status: str, driver_id: str = None):
+    """Update ride status in Postgres."""
+    with engine.begin() as conn:
+        if driver_id:
+            conn.execute(
+                text("""
+                    UPDATE rides
+                    SET status = :status,
+                        driver_id = :driver_id,
+                        updated_at = now()
+                    WHERE id = :ride_id
+                """),
+                {"status": new_status,
+                 "driver_id": driver_id,
+                 "ride_id": ride_id},
+            )
+        else:
+            conn.execute(
+                text("""
+                    UPDATE rides
+                    SET status = :status,
+                        updated_at = now()
+                    WHERE id = :ride_id
+                """),
+                {"status": new_status, "ride_id": ride_id},
+            )
+
+
+def mark_driver_busy(driver_id: str):
+    """Remove driver from available pool in Redis."""
+    redis_client.delete(f"driver:available:{driver_id}")
+
+
+def run_offer_loop(ride_id: str, pickup_lat: float, pickup_lng: float):
+    """
+    Core offer-accept loop.
+    Iterates through ranked drivers one by one until:
+    - A driver accepts → ride.matched
+    - All drivers reject/timeout → ride.no_drivers_available
+    """
+    candidates = get_ranked_drivers(pickup_lat, pickup_lng)
+
+    if not candidates:
+        print(f"  No drivers found near {pickup_lat}, {pickup_lng}")
+        update_ride_status(ride_id, "NO_DRIVERS")
+        producer.send("ride.no_drivers_available", value={
+            "event_type": "ride.no_drivers_available",
+            "ride_id": ride_id,
+        })
+        producer.flush()
+        return
+
+    print(f"  Found {len(candidates)} candidate drivers: "
+          f"{[c['driver_id'] for c in candidates]}")
+
+    # Update ride to OFFERED in Postgres
+    update_ride_status(ride_id, "OFFERED")
+
+    for candidate in candidates:
+        driver_id = candidate["driver_id"]
+        distance_km = candidate["distance_km"]
+
+        print(f"\n  Offering ride {ride_id} to {driver_id} "
+              f"({distance_km} km away)...")
+
+        # Send offer — stores in Redis with TTL
+        send_offer(ride_id, driver_id, distance_km)
+
+        # Poll for driver response (check Redis every 0.5s for up to timeout)
+        offer_key = f"offer:{ride_id}"
+        response_key = f"response:{ride_id}:{driver_id}"
+        accepted = False
+        elapsed = 0
+
+        while elapsed < OFFER_TIMEOUT_SECONDS:
+            time.sleep(0.5)
+            elapsed += 0.5
+
+            # Check if driver responded
+            response = redis_client.get(response_key)
+
+            if response == "accepted":
+                accepted = True
+                redis_client.delete(response_key)
+                redis_client.delete(offer_key)
+                break
+
+            elif response == "rejected":
+                redis_client.delete(response_key)
+                redis_client.delete(offer_key)
+                print(f"  {driver_id} rejected the offer.")
+                break
+
+            # Check if offer TTL expired (timeout)
+            if not redis_client.exists(offer_key):
+                print(f"  {driver_id} timed out (no response in "
+                      f"{OFFER_TIMEOUT_SECONDS}s).")
+                break
+
+        if accepted:
+            # Assign driver transactionally
+            mark_driver_busy(driver_id)
+            update_ride_status(ride_id, "MATCHED", driver_id)
+
+            producer.send("ride.matched", value={
+                "event_type": "ride.matched",
+                "ride_id": ride_id,
+                "driver_id": driver_id,
+                "distance_km": distance_km,
+            })
+            producer.flush()
+            print(f"  ✓ Driver {driver_id} accepted! "
+                  f"Ride {ride_id} is MATCHED.")
+            return  # Done — exit loop
+
+        # Driver rejected/timed out — try next candidate
+        print(f"  Trying next driver...")
+
+    # All candidates exhausted
+    print(f"  All drivers rejected. Ride {ride_id} has NO_DRIVERS.")
+    update_ride_status(ride_id, "NO_DRIVERS")
+    producer.send("ride.no_drivers_available", value={
+        "event_type": "ride.no_drivers_available",
+        "ride_id": ride_id,
+        "reason": "all_drivers_rejected_or_timed_out",
+    })
+    producer.flush()
+
+
+# ── Kafka consumer ────────────────────────────────────────────────────────────
 def start_consumer():
     print("Starting Kafka consumer for ride.requested...")
     consumer = KafkaConsumer(
         "ride.requested",
         bootstrap_servers=KAFKA_BOOTSTRAP,
         group_id="dispatch-matching-group",
-        auto_offset_reset="earliest",
+        auto_offset_reset="latest",
         value_deserializer=lambda m: json.loads(m.decode("utf-8")),
     )
     for message in consumer:
-        try:
-            process_ride_requested(message.value)
-        except Exception as e:
-            print(f"Error processing message: {e}")
+        event = message.value
+        ride_id = event.get("ride_id")
+        pickup_lat = event.get("pickup_lat")
+        pickup_lng = event.get("pickup_lng")
+
+        print(f"\n Ride requested: {ride_id}")
+        print(f"  Pickup: {pickup_lat}, {pickup_lng}")
+
+        # Run offer loop in a separate thread so consumer
+        # doesn't block on waiting for driver responses
+        thread = threading.Thread(
+            target=run_offer_loop,
+            args=(ride_id, pickup_lat, pickup_lng),
+            daemon=True,
+        )
+        thread.start()
 
 
 @app.on_event("startup")
@@ -155,7 +240,7 @@ def startup():
     thread.start()
 
 
-# ── health + status endpoints ─────────────────────────────────────────────────
+# ── health ────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"service": "dispatch-matching-service", "status": "running"}
@@ -168,14 +253,12 @@ def health():
         redis_ok = True
     except Exception:
         redis_ok = False
-
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         db_ok = True
     except Exception:
         db_ok = False
-
     return {
         "redis": "ok" if redis_ok else "error",
         "postgres": "ok" if db_ok else "error",
