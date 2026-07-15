@@ -3,8 +3,18 @@ from fastapi import FastAPI, HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from jose import jwt, JWTError
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Rapido - API Gateway")
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # React dev server
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 SECRET_KEY = "rapido-dev-secret-key-change-in-production"
 ALGORITHM = "HS256"
