@@ -19,3 +19,4 @@ export const useEvents = () => {
 
     return { events, addEvent, clearEvents };
 };
+
